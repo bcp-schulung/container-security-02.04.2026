@@ -7,3 +7,4 @@ docker run --rm -it \
            -v /etc:/host/etc:ro \
            falcosecurity/falco:0.43.0
 
+sudo cat /etc/shadow
