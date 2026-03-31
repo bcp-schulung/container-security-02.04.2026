@@ -1,0 +1,7 @@
+services:
+  nginx:
+    image: registry.it-scholar.com/bc-nginx:v1
+    ports:
+      - "3333:80"
+    environment:
+      TEST_ENV: "test"
