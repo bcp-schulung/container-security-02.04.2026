@@ -1,6 +1,7 @@
 FROM alpine:3.23.3
 
 RUN set -eux; \
+    apk upgrade --no-cache; \
     apk add --no-cache nginx
 
 RUN addgroup -S nginx || true
