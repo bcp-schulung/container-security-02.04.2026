@@ -11,6 +11,8 @@ VMS_FILE="vms.txt"
 PASSWORDS_FILE="vm_passwords.csv"
 IDE_USER="devuser"
 IDE_PORT="8080"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+KUBECONFIG_FILE="${SCRIPT_DIR}/../exercise-9/config"
 DRY_RUN="false"
 PARALLEL="false"
 PARALLEL_JOBS="3"
@@ -25,6 +27,7 @@ Options:
   --parallel        Deploy to multiple VMs in parallel
   --jobs N          Number of parallel jobs (default: 3, used with --parallel)
   --verify          Verify service health after deployment
+  --kubeconfig FILE Local kubeconfig to install as /home/$IDE_USER/.kube/config
   -h, --help        Show this help
 EOF
 }
@@ -42,6 +45,14 @@ while [[ $# -gt 0 ]]; do
     --verify)
       VERIFY="true"
       shift
+      ;;
+    --kubeconfig)
+      if [[ $# -lt 2 ]]; then
+        echo "[ERROR] --kubeconfig requires a file path"
+        exit 1
+      fi
+      KUBECONFIG_FILE="$2"
+      shift 2
       ;;
     --jobs)
       if [[ $# -lt 2 ]]; then
@@ -79,6 +90,11 @@ if [[ ! -f "$PASSWORDS_FILE" ]]; then
   exit 1
 fi
 
+if [[ ! -f "$KUBECONFIG_FILE" ]]; then
+  echo "[ERROR] kubeconfig file not found: $KUBECONFIG_FILE"
+  exit 1
+fi
+
 # Auto-correct if a public key path was provided by mistake.
 if [[ "$SSH_KEY_PATH" == *.pub ]]; then
   maybe_private="${SSH_KEY_PATH%.pub}"
@@ -113,13 +129,16 @@ get_password_for_ip() {
 deploy_one_vm() {
   local ip="$1"
   local vm_password="$2"
+  local kubeconfig_b64=""
 
   if [[ "$DRY_RUN" == "true" ]]; then
     echo "[DRY-RUN] $ip"
     echo "  - SSH as $SSH_USER using key $SSH_KEY_PATH"
     echo "  - Create/update user: $IDE_USER"
     echo "  - Install code-server if missing"
+    echo "  - Install kubectl if missing"
     echo "  - Configure password auth on port $IDE_PORT"
+    echo "  - Install kubeconfig: /home/$IDE_USER/.kube/config"
     echo "  - Enable service: code-server@$IDE_USER"
     echo "  - Open firewall ports: $IDE_PORT/tcp (if ufw exists)"
     return 0
@@ -127,12 +146,14 @@ deploy_one_vm() {
 
   echo "[INFO] Deploying on $ip ..."
 
+  kubeconfig_b64="$(base64 < "$KUBECONFIG_FILE" | tr -d '\n')"
+
   if ! ssh -i "$SSH_KEY_PATH" \
     -o BatchMode=yes \
     -o ConnectTimeout=15 \
     -o StrictHostKeyChecking=accept-new \
     "$SSH_USER@$ip" \
-    "IDE_USER='$IDE_USER' IDE_PORT='$IDE_PORT' IDE_PASS='$vm_password' bash -s" <<'REMOTE_SCRIPT'
+    "IDE_USER='$IDE_USER' IDE_PORT='$IDE_PORT' IDE_PASS='$vm_password' KUBECONFIG_B64='$kubeconfig_b64' bash -s" <<'REMOTE_SCRIPT'
 set -euo pipefail
 
 if ! command -v apt-get >/dev/null 2>&1; then
@@ -143,6 +164,19 @@ fi
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get install -y curl sudo git ca-certificates gnupg
+
+# -- kubectl ---------------------------------------------------------------
+if ! command -v kubectl >/dev/null 2>&1; then
+  install -d -m 755 /etc/apt/keyrings
+  curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key \
+    | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  chmod 644 /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  cat > /etc/apt/sources.list.d/kubernetes.list <<'EOF'
+deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /
+EOF
+  apt-get update -y
+  apt-get install -y kubectl
+fi
 
 # ── code-server ──────────────────────────────────────────────────────────────
 if ! command -v code-server >/dev/null 2>&1; then
@@ -169,6 +203,11 @@ password: $IDE_PASS
 cert: false
 EOF
 chown "$IDE_USER:$IDE_USER" "/home/$IDE_USER/.config/code-server/config.yaml"
+
+install -d -m 700 -o "$IDE_USER" -g "$IDE_USER" "/home/$IDE_USER/.kube"
+printf '%s' "$KUBECONFIG_B64" | base64 -d > "/home/$IDE_USER/.kube/config"
+chown "$IDE_USER:$IDE_USER" "/home/$IDE_USER/.kube/config"
+chmod 600 "/home/$IDE_USER/.kube/config"
 
 systemctl daemon-reload
 systemctl enable --now "code-server@$IDE_USER"
@@ -215,6 +254,8 @@ verify_one_vm() {
     echo "[DRY-RUN] verify $ip"
     echo "  - Check service: code-server@$IDE_USER is active"
     echo "  - Check local HTTP on 127.0.0.1:$IDE_PORT"
+    echo "  - Check kubectl is installed"
+    echo "  - Check /home/$IDE_USER/.kube/config exists and is readable"
     return 0
   fi
 
@@ -223,7 +264,11 @@ verify_one_vm() {
     -o ConnectTimeout=15 \
     -o StrictHostKeyChecking=accept-new \
     "$SSH_USER@$ip" \
-    "systemctl is-active --quiet 'code-server@$IDE_USER' && curl -fsS --max-time 5 'http://127.0.0.1:$IDE_PORT' >/dev/null"; then
+    "systemctl is-active --quiet 'code-server@$IDE_USER' \
+    && curl -fsS --max-time 5 'http://127.0.0.1:$IDE_PORT' >/dev/null \
+    && command -v kubectl >/dev/null 2>&1 \
+    && test -s '/home/$IDE_USER/.kube/config' \
+    && sudo -u '$IDE_USER' kubectl --kubeconfig '/home/$IDE_USER/.kube/config' config current-context >/dev/null"; then
     echo "[VERIFY-OK] $ip"
     return 0
   fi
